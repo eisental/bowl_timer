@@ -1,12 +1,13 @@
 #include "LEDFader.h"
 #include "secrets.h"
+#include <ArduinoJson.h>
 #include <ArduinoMqttClient.h>
 #include <R4_Touch.h>
 #include <TimeAlarms.h>
-#include <WiFi101.h>
-
+#include <WiFiS3.h>
 /*
   meditation-timer v2 - june, 2024
+  by Tal Eisenberg (https://www.github.com/eisental)
 */
 
 enum state { idle, preparing, meditating };
@@ -85,13 +86,28 @@ void disableAlarms();
 // state machine
 
 void prepare() {
-  readDurations();
+
+  Serial.print("Starting timer: total - ");
+  Serial.print(totalDuration / 60);
+  Serial.print(" mins; interval - ");
+  Serial.print(intervalDuration / 60);
+  Serial.print(" mins; preparation - ");
+  Serial.print(preparationDuration);
+  Serial.println(" secs.");
 
   currentState = preparing;
   currentIntervalAlarm = Alarm.timerOnce(preparationDuration, meditate);
   activityLed.fade(255, preparationDuration * 1000);
   standbyLed.fade(255, 1000);
   currentActivityAlarm = Alarm.timerOnce(1, fadeOutStandbyLed);
+
+  char payload[100];
+  sprintf(payload,
+          "{\"state\":\"preparing\", \"totalDuration\":%d, "
+          "\"intervalDuration\":%d, \"preparationDuration\":%d, "
+          "\"reason\":\"start\"}",
+          totalDuration, intervalDuration, preparationDuration);
+  publishMQTT(payload);
 }
 
 void meditate() {
@@ -106,9 +122,11 @@ void endMeditation() {
   chime(longChimeStrike);
   standbyLed.fade(0, 5000);
   reset();
+  publishMQTT("{\"state\":\"idle\", \"reason\":\"end\"}");
 }
 
 void pause() {
+  isPaused = true;
   disableAlarms();
 
   int finishedIntervalDuration = (millis() - intervalStartTime) / 1000;
@@ -120,6 +138,9 @@ void pause() {
   // turn off standby led while paused.
   standbyLed.fade(0, 200);
 
+  publishMQTT(
+      "{\"state\":\"meditating\", \"paused\":true, \"reason\":\"pause\"}");
+
   // DEBUG
   Serial.print("PAUSED | remaining: ");
   Serial.print(remainingIntervalDuration);
@@ -129,14 +150,19 @@ void pause() {
 }
 
 void unpause() {
+  isPaused = false;
   activityLed.fade(0, 200);
   startInterval(remainingIntervalDuration, 0);
+  publishMQTT(
+      "{\"state\":\"meditating\", \"paused\":false, \"reason\":\"unpause\"}");
 }
 
 void cancel() {
+  Serial.println("Cancelling meditation");
   standbyLed.fade(0, 500);
   activityLed.fade(0, 500);
   reset();
+  publishMQTT("{\"state\":\"idle\", \"reason\":\"cancel\"}");
 }
 
 void reset() {
@@ -151,14 +177,14 @@ void reset() {
 void onShortTouch() {
   switch (currentState) {
   case idle:
+    readDurations();
     prepare();
     break;
   case preparing:
     cancel();
     break;
   case meditating:
-    isPaused = !isPaused;
-    if (isPaused) {
+    if (!isPaused) {
       pause();
     } else {
       unpause();
@@ -181,6 +207,13 @@ void startInterval(int intervalDuration, int strikeDuration) {
 
   activityLed.fade(255, 1000);
   currentActivityAlarm = Alarm.timerOnce(1, fadeOutActivityLed);
+
+  char msg[256];
+  sprintf(msg,
+          "{\"state\":\"meditating\", \"remaining\":%d, "
+          "\"reason\":\"startInterval\"}",
+          remainingTotalDuration);
+  publishMQTT(msg);
 
   // DEBUG
   Serial.print("Starting interval of ");
@@ -228,77 +261,173 @@ void fadeOutStandbyLed() { standbyLed.fade(0, 1000); }
 
 // WiFi + MQTT
 
+char publish_topic[] = "bowl_timer/status";
+char subscribe_topic[] = "bowl_timer/command";
+
 WiFiClient wifi;
 MqttClient mqtt(wifi);
 
-void setupMQTT() {
-  display.clearDisplay();
-  display.setCursor(0, 0);
-  display.print("WiFi: ");
-  display.println(wifiSSID);
-  display.display();
+void onMQTTMessage(int messageSize) {
+  if (mqtt.available() > 0) {
+    StaticJsonDocument<2048> json;
+    DeserializationError error = deserializeJson(json, mqtt);
 
-  // TODO: try to connect in the background
-  while (WiFi.begin(wifiSSID, wifiPass) != WL_CONNECTED) {
-    display.print(".");
-    display.display();
-    readButton();
-    if (buttonState) {
+    switch (error.code()) {
+    case DeserializationError::Ok:
       break;
-      buttonState = false;
+    case DeserializationError::EmptyInput:
+      return;
+    case DeserializationError::IncompleteInput:
+    case DeserializationError::InvalidInput:
+    case DeserializationError::NoMemory:
+    default:
+      publishError(error.c_str());
+      return;
     }
+
+    if (json.is<JsonArray>()) {
+      runCommand(json.as<JsonArray>());
+    } else {
+      publishError("Expecting json root to be an array or an object.");
+    }
+  }
+}
+
+void publishError(const char *msg) {
+  char err[256];
+  sprintf(err, "{\"error\": \"%s\"}", msg);
+  publishMQTT(err);
+}
+
+void runCommand(JsonArray c) {
+  if (c.size() < 1) {
+    publishError("Expecting at least one command.");
+    return;
+  }
+
+  if (!c[0].is<const char *>()) {
+    publishError("Invalid command name");
+    return;
+  }
+
+  if (c[0] == "chime") {
+    if (c.size() > 1) {
+      if (!c[1].is<int>()) {
+        publishError("Invalid chime duration");
+        return;
+      }
+
+      char msg[256];
+      sprintf(msg, "Chiming for %d ms.", (int)c[1]);
+      Serial.println(msg);
+      chime(c[1]);
+    } else {
+      Serial.println("Chiming default duration.");
+      chime(longChimeStrike);
+    }
+  } else if (c[0] == "start") {
+    if (c.size() < 4) {
+      publishError("Expecting start command to have three arguments");
+      return;
+    }
+
+    if (!c[1].is<int>() || !c[2].is<int>() || !c[3].is<int>()) {
+      publishError("Invalid start command arguments");
+      return;
+    }
+    if (currentState != idle) {
+      publishError("Timer is already running.");
+      return;
+    }
+    totalDuration = c[1];
+    intervalDuration = c[2];
+    preparationDuration = c[3];
+    prepare();
+  } else if (c[0] == "pause") {
+    if (c.size() < 2) {
+      publishError("Expecting pause command to have one argument");
+      return;
+    }
+
+    if (currentState != meditating) {
+      publishError("Timer is not currently running.");
+      return;
+    }
+
+    if (!c[1].is<bool>()) {
+      publishError("Invalid pause command arguments");
+      return;
+    }
+
+    if (c[1]) {
+      pause();
+    } else {
+      unpause();
+    }
+  } else if (c[0] == "cancel") {
+    if (currentState == idle) {
+      publishError("Timer is not currently running.");
+      return;
+    }
+
+    cancel();
+  } else {
+    publishError("Unknown command");
+  }
+}
+
+void setupMQTT() {
+  Serial.print("Connecting to WiFi ");
+  Serial.println(wifiSSID);
+
+  if (WiFi.status() == WL_NO_MODULE) {
+    Serial.println("No WiFi module!");
+    return;
+  }
+
+  String fv = WiFi.firmwareVersion();
+  if (fv < WIFI_FIRMWARE_LATEST_VERSION) {
+    Serial.println("Please upgrade the WiFi firmware");
+  }
+
+  while (WiFi.begin(wifiSSID, wifiPass) != WL_CONNECTED) {
+    Serial.print(".");
     delay(1000);
   }
 
-  display.clearDisplay();
-  display.setCursor(0, 0);
   if (WiFi.status() == WL_CONNECTED) {
-    display.println("Connected!");
-    display.display();
+    Serial.println("Connected!");
   } else {
-    display.println("No WiFi!");
-    display.display();
+    Serial.println("No WiFi!");
     return;
   }
 
   delay(500);
-  display.clearDisplay();
-  display.setCursor(0, 0);
-  display.println("Connecting to MQTT:");
-  display.print(mqttHost);
-  display.print(":");
-  display.println(mqttPort);
-  display.display();
+  Serial.println("Connecting to MQTT:");
+  Serial.print(mqttHost);
+  Serial.print(":");
+  Serial.println(mqttPort);
 
   if (!mqtt.connect(mqttHost, mqttPort)) {
     char err[80];
     sprintf(err, "MQTT connect failed. Error code: %ld", mqtt.connectError());
-    freezeOnError(err);
-  } else {
-    display.clearDisplay();
-    display.setCursor(0, 0);
-    display.println("Connected to MQTT!\n");
-    delay(500);
+    Serial.println(err);
+    return;
   }
+
+  Serial.println("Connected to MQTT!\n");
+  publishMQTT("{\"state\":\"online\"}");
+
+  mqtt.onMessage(onMQTTMessage);
+  mqtt.subscribe(subscribe_topic);
 }
 
-void publishMQTT() {
+void publishMQTT(char message[]) {
   if (!mqtt.connected()) {
     return;
   }
-  publishToggle = !publishToggle;
-  mqtt.beginMessage(mqttTopic);
-  mqtt.print("{\"probe_temp\": ");
-  mqtt.print(thermoCoupleValue);
-  mqtt.print(", \"ambient_temp\": ");
-  mqtt.print(ambientTempValue);
-  mqtt.print(", \"uv\": ");
-  mqtt.print(uvValue);
-  mqtt.print(", \"light\": ");
-  mqtt.print(lightValue);
-  mqtt.print(", \"timestamp\": ");
-  mqtt.print(millis());
-  mqtt.println("}");
+  mqtt.beginMessage(publish_topic);
+  mqtt.print(message);
   mqtt.endMessage();
 }
 
@@ -348,7 +477,6 @@ void readCapacitiveTouch() {
     }
 
     if (touchDuration > longTouchDuration && currentState != idle) {
-      Serial.println("Cancelling meditation");
       onLongTouch();
     }
   } else {
@@ -372,17 +500,15 @@ void readDurations() {
                   maxTotalDuration);
   int interval = map(analogRead(intervalDurationPin), 0, 1023,
                      minIntervalDuration, maxIntervalDuration);
-  int prepReading = analogRead(preparationDurationPin);
-  int preparation =
-      map(prepReading, 0, 1023, minPreparationDuration, maxPreparationDuration);
+  int preparation = map(analogRead(preparationDurationPin), 0, 1023,
+                        minPreparationDuration, maxPreparationDuration);
 
   Serial.print(total);
   Serial.print(" ");
   Serial.print(interval);
   Serial.print(" ");
   Serial.println(preparation);
-  Serial.println(prepReading);
-  Serial.print("\n");
+
   // reduce durations resolution.
 
   if (total < 10 * 60) {
@@ -408,14 +534,6 @@ void readDurations() {
     // 5 second jumps
     preparationDuration = roundDiv(preparation, 5) * 5;
   }
-
-  Serial.print("Configuration: total - ");
-  Serial.print(totalDuration / 60);
-  Serial.print(" mins; interval - ");
-  Serial.print(intervalDuration / 60);
-  Serial.print(" mins; preparation - ");
-  Serial.print(preparationDuration);
-  Serial.println(" secs.");
 }
 
 // MAIN HOOKS
@@ -431,13 +549,17 @@ void setup() {
   bowlTouch.applyPinSettings(touchSettings);
   TouchSensor::start(); // TODO: is this good or better to use startSingle?
 
+  // initialize serial
   Serial.begin(115200);
   Serial.println("Meditation Timer");
+
+  // initialize wifi + mqtt
+  setupMQTT();
 }
 
 void loop() {
   updateLeds();
   readCapacitiveTouch();
-
+  mqtt.poll();
   Alarm.delay(10);
 }
