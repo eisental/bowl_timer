@@ -74,7 +74,11 @@ int remainingTotalDuration;      // in seconds
 int remainingIntervalDuration;   // in seconds
 unsigned long intervalStartTime; // in milliseconds
 
-void readDurations();
+int curPreparationMeasurement = -1;
+int curIntervalMeasurement = -1;
+int curTotalMeasurement = -1;
+
+void setDurationsFromKnobs();
 void meditate();
 void fadeOutStandbyLed();
 void fadeOutActivityLed();
@@ -177,7 +181,7 @@ void reset() {
 void onShortTouch() {
   switch (currentState) {
   case idle:
-    readDurations();
+    setDurationsFromKnobs();
     prepare();
     break;
   case preparing:
@@ -326,6 +330,18 @@ void runCommand(JsonArray c) {
       chime(longChimeStrike);
     }
   } else if (c[0] == "start") {
+    if (currentState != idle) {
+      publishError("Timer is already running.");
+      return;
+    }
+
+    if (c.size() == 1) {
+      // use knobs for durations
+      setDurationsFromKnobs();
+      prepare();
+      return;
+    }
+
     if (c.size() < 4) {
       publishError("Expecting start command to have three arguments");
       return;
@@ -335,10 +351,7 @@ void runCommand(JsonArray c) {
       publishError("Invalid start command arguments");
       return;
     }
-    if (currentState != idle) {
-      publishError("Timer is already running.");
-      return;
-    }
+
     totalDuration = c[1];
     intervalDuration = c[2];
     preparationDuration = c[3];
@@ -494,14 +507,20 @@ void readCapacitiveTouch() {
 
 int roundDiv(int a, int b) { return round((float)a / (float)b); }
 
-void readDurations() {
+void setDurationsFromKnobs() {
   // read analog pins and scale values.
-  int total = map(analogRead(totalDurationPin), 0, 1023, minTotalDuration,
-                  maxTotalDuration);
-  int interval = map(analogRead(intervalDurationPin), 0, 1023,
-                     minIntervalDuration, maxIntervalDuration);
-  int preparation = map(analogRead(preparationDurationPin), 0, 1023,
-                        minPreparationDuration, maxPreparationDuration);
+  int total = constrain(
+      map(curTotalMeasurement, 980, 0, minTotalDuration, maxTotalDuration),
+      minTotalDuration, maxTotalDuration);
+
+  int interval = constrain(map(curIntervalMeasurement, 920, 0,
+                               minIntervalDuration, maxIntervalDuration),
+                           minIntervalDuration, maxIntervalDuration);
+
+  int preparation =
+      constrain(map(curPreparationMeasurement, 1023, 0, minPreparationDuration,
+                    maxPreparationDuration),
+                minPreparationDuration, maxPreparationDuration);
 
   Serial.print(total);
   Serial.print(" ");
@@ -536,6 +555,12 @@ void readDurations() {
   }
 }
 
+void readKnobs() {
+  curTotalMeasurement = analogRead(totalDurationPin);
+  curIntervalMeasurement = analogRead(intervalDurationPin);
+  curPreparationMeasurement = analogRead(preparationDurationPin);
+}
+
 // MAIN HOOKS
 
 void setup() {
@@ -559,6 +584,7 @@ void setup() {
 
 void loop() {
   updateLeds();
+  readKnobs();
   readCapacitiveTouch();
   mqtt.poll();
   Alarm.delay(10);
